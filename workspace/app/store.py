@@ -305,6 +305,87 @@ CREATE TABLE IF NOT EXISTS lease_meta (
     k               TEXT PRIMARY KEY,
     v               TEXT NOT NULL
 );
+
+-- ===== 已发行版本事故隔离（信任熔断与恢复）=====
+-- 单例元数据：谱系信任代次（隔离代次）。每次事故隔离提交或可信恢复提交都 +1。
+-- 冻结快照指纹内嵌该代次，因此任何旧检查结果/旧签核都绑定其产生代次，
+-- 不可能跨隔离代次复用（即使恢复后谱系指纹看起来“没变”）。
+CREATE TABLE IF NOT EXISTS isolation_meta (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    generation      INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO isolation_meta(id,generation) VALUES(1,0);
+
+-- 质量负责人登记的事故：故障批次、命中的已发行版本、原因与证据。
+-- request_key 全局唯一：相同事故请求重复到达只返回首次裁决（deduped:true），
+-- 绝不产生第二次状态迁移。
+CREATE TABLE IF NOT EXISTS incident (
+    id                  TEXT PRIMARY KEY,
+    batch               TEXT NOT NULL,
+    faulty_baseline_id  TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    evidence_json       TEXT NOT NULL,
+    registered_by       TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    request_key         TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL
+);
+
+-- 版本信任覆盖：事故命中的版本及其全部后代标 UNTRUSTED；双角色恢复后回 TRUSTED。
+-- 每个 (基线, 隔离代次) 一行不可变历史，seq 最大者即当前信任态；无行的基线沿
+-- parent 链继承信任（R0 恒可信）。
+CREATE TABLE IF NOT EXISTS baseline_trust (
+    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_id         TEXT NOT NULL,
+    status              TEXT NOT NULL,            -- UNTRUSTED / TRUSTED
+    generation          INTEGER NOT NULL,
+    incident_id         TEXT,
+    via                 TEXT NOT NULL,            -- QUARANTINE / RESTORE / RELEASE
+    by                  TEXT NOT NULL,
+    at                  TEXT NOT NULL,
+    UNIQUE(baseline_id, generation)
+);
+CREATE INDEX IF NOT EXISTS idx_trust_baseline ON baseline_trust(baseline_id, seq);
+
+-- 隔离 / 恢复裁决：两阶段状态机，服务中断后从 isolation_journal 续裁。
+-- QUARANTINING ─finish─▶ QUARANTINED ；RESTORING ─finish─▶ RESTORED ；
+-- FAILED 表示与隔离并发、被 fail-closed 熔断的进行中发布。
+CREATE TABLE IF NOT EXISTS quarantine (
+    id                  TEXT PRIMARY KEY,
+    incident_id         TEXT,
+    kind                TEXT NOT NULL,            -- QUARANTINE / RESTORE
+    faulty_baseline_id  TEXT NOT NULL,
+    root_baseline_id    TEXT,                     -- RESTORE 时被恢复的事故命中根
+    state               TEXT NOT NULL,
+    generation          INTEGER,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    detail_json         TEXT NOT NULL DEFAULT '{}',
+    failpoint           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_incident ON quarantine(incident_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_state ON quarantine(state);
+
+-- 恢复可信状态的双角色确认（两个不同角色、且必须是两个不同自然人）
+CREATE TABLE IF NOT EXISTS restore_confirm (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarantine_id   TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    user            TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    UNIQUE(quarantine_id, role)
+);
+
+-- 裁决落盘日志：阶段1锁定 / 阶段2提交 / 中断恢复 / 熔断发布均在此留痕
+CREATE TABLE IF NOT EXISTS isolation_journal (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarantine_id   TEXT NOT NULL,
+    incident_id     TEXT,
+    event           TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    detail_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_isolation_journal_q ON isolation_journal(quarantine_id, seq);
 """
 
 
@@ -406,6 +487,12 @@ class Store:
                 c.execute("ALTER TABLE eco ADD COLUMN impact_snapshot_id TEXT")
             if "impact_input_json" not in eco_cols:
                 c.execute("ALTER TABLE eco ADD COLUMN impact_input_json TEXT")
+            # 事故隔离：ECO 冻结时谱系所处的隔离代次；冻结后工程师显式“重新对齐”
+            # 到的可信祖先（无则沿 trunk；隔离命中时冻结会被拒绝并引导到该祖先）。
+            if "isolation_generation" not in eco_cols:
+                c.execute("ALTER TABLE eco ADD COLUMN isolation_generation INTEGER NOT NULL DEFAULT 0")
+            if "preferred_parent_id" not in eco_cols:
+                c.execute("ALTER TABLE eco ADD COLUMN preferred_parent_id TEXT")
 
     # ---- 事务辅助 ----
     class _Tx:
@@ -472,6 +559,9 @@ class Store:
                       "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
                       "lease_event", "lease_claim", "check_lease", "impact_override",
                       "impact_latest", "impact_snapshot", "impact_request",
-                      "impact_current", "impact_topology"]:
+                      "impact_current", "impact_topology",
+                      "isolation_journal", "restore_confirm", "quarantine",
+                      "baseline_trust", "incident"]:
                 c.execute(f"DELETE FROM {t}")
+            c.execute("UPDATE isolation_meta SET generation=0 WHERE id=1")
         self._seed()

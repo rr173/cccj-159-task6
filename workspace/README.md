@@ -84,6 +84,39 @@
   （`STALE_SUPERSEDED`）、依赖门禁（`DEPENDENCY_BLOCKED`），FAIL 仍只能走既有
   `rerun`，双签与两阶段发布约束完全不变；ECO 侧 `rejected_result` 与租约侧审计双侧留痕。
 
+## 已发行版本事故隔离（信任熔断与双角色恢复）
+
+已发行芯片版本被现场/质量判废时，质量负责人在操作页 `/isolation`
+（API 前缀 `/api/isolation`）登记**故障批次、命中版本、原因与证据**，系统据此裁决：
+
+- **谱系熔断**：命中版本及其**全部后代**（沿 `parent_id` 闭包）标 `UNTRUSTED`，写入
+  不可变信任覆盖 `baseline_trust`；它们禁止继续充当新变更的父版本——冻结报
+  `PARENT_BASELINE_QUARANTINED` 并给出最近可信祖先，发行报 `LINEAGE_QUARANTINED`。
+  尚未发行的关联 ECO（FROZEN/QUEUED/REBASE_REQUIRED，trunk 命中时含无父版本草稿）
+  整批转回 `REBASE_REQUIRED`（待重新对齐），旧检查 `SUPERSEDED`、旧签核失效、模块锁释放，
+  并在 `rejected_result` 留痕；可 `POST /api/ecos/{id}/realign` 显式对齐可信祖先。
+- **隔离代次（isolation_generation）**：每次隔离提交或可信恢复都令全局隔离代次 +1，
+  且代次进入冻结快照指纹（`trust_context`）。因此代次一变整体指纹即变，
+  **任何旧检查结果、旧签核都绑定其产生代次，不可能跨隔离代次复用**
+  （恢复不是"回到原样"，恢复后必须在新代次重新验证、重新双签）。
+- **隔离与新发行同谱系原子裁决**：隔离/恢复均为两阶段
+  （`QUARANTINING/RESTORING` 先落盘日志 → 阶段2提交），与 `release` 在单事务
+  `BEGIN IMMEDIATE` 内裁决。隔离 fail-closed **熔断进行中的 `RELEASING` 发行**
+  （release 行置 `FAILED`、ECO 转回待重新对齐、resume 拒绝救活）；进行态裁决期间
+  命中谱系上的新发行以 `ISOLATION_IN_PROGRESS` 拒绝，绝不出现"隔离与发行都成功"。
+- **事故请求幂等**：登记携带 `request_key`（缺省由批次/命中版本/原因/证据/登记人
+  内容指纹派生），相同请求重复到达只回放首次裁决（`deduped:true`）；
+  命中版本已不可信时的同内容重复登记同样回放，**不产生第二次状态迁移、不新增代次**。
+- **崩溃续裁**：阶段1落盘后服务中断，启动 `recover()` 从 `isolation_journal`
+  续裁未完成的隔离/恢复；恢复续裁时条件不再满足（如期间出现分叉）则保持中断态并记
+  `RECOVER_BLOCKED`，绝不带错误状态提交。
+- **双角色恢复 + 无分叉**：恢复可信须由**质量负责人 + 发行负责人两个不同自然人**
+  确认（同人 `DUAL_ROLE_CONFLICT`、缺角色 `DUAL_ROLE_CONFIRM_REQUIRED`）；
+  且隔离期间谱系不得在可信祖先上长出绕过命中链的修复发行，否则
+  `LINEAGE_FORKED_SINCE_QUARANTINE`（返回分叉基线与可信锚点，引导以修复分支重建）。
+- **操作页四块视图**：受影响版本谱系树（含分叉/可信锚点）、当前可信祖先、
+  待处理变更（一键重新对齐）、事故裁决与隔离审计（阶段锁定/提交/熔断/续裁全留痕）。
+
 ## 快速开始
 
 ```bash
@@ -96,6 +129,8 @@ open http://localhost:8080
 open http://localhost:8080/ops
 # 电路影响闭包操作页（拓扑版本、传播解释、人工排除、审计）
 open http://localhost:8080/impact
+# 已发行版本事故隔离操作页（事故登记、受影响谱系、可信祖先、待处理变更、隔离审计）
+open http://localhost:8080/isolation
 
 # 启动独立的设计签名封装服务（默认 8090，SQLite + 内容寻址 blob 落盘）
 python3 -m app.envelope_api --db data/envelope.db --port 8090
@@ -107,7 +142,7 @@ python3 -m app.envelope_cli --db data/envelope.db demo
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（98 个：原 ECO/租约/API 73 个 + 签名封装 11 个 + 影响闭包 14 个）
+# 全部测试（121 个：原 ECO/租约/API 73 个 + 签名封装 11 个 + 影响闭包 14 个 + 事故隔离 23 个）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -115,8 +150,9 @@ python3 -m unittest discover -s tests -v
 
 ```
 app/
-  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约与租约审计表
-  service.py  领域核心：冻结指纹、影响闭包绑定、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
+  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约/事故隔离与信任覆盖表
+  service.py  领域核心：冻结指纹(含隔离代次)、影响闭包绑定、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、谱系信任原语、差异包
+  isolation.py 已发行版本事故隔离：事故登记、谱系信任熔断、同谱系原子并发裁决、幂等、落盘续裁、双角色无分叉恢复
   impact.py   版本化电路拓扑、影响闭包传播、跨时钟/接口/约束/策略强制节点、人工排除与审计
   leases.py   验证执行租约协调：幂等领取(原子单赢家)、续租、代次+HMAC凭据完成、超时接管、重启恢复
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
@@ -134,6 +170,8 @@ web/
   ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
   impact.html 电路影响闭包操作页（拓扑版本、闭包候选、传播边解释、人工排除、审计）
   impact.js   零依赖 JS；发布拓扑、计算闭包、提交带理由排除并展示可操作错误
+  isolation.html 已发行版本事故隔离操作页（事故登记、受影响谱系树、可信祖先、待处理变更、双角色恢复、隔离审计）
+  isolation.js   零依赖 JS；登记隔离、双角色恢复、重新对齐、审计刷新
   envelopes.html 设计签名发布信封页面（谱系、签名状态、校验结果、审计）
   envelopes.js   零依赖 JS；支持浏览器 Ed25519 签名与信封/发布查询
 tests/
@@ -141,6 +179,7 @@ tests/
   test_delegation.py  18 个临时代理签核测试
   test_leases.py      22 个租约协调不变量测试（并发单赢家/幂等/代次凭据/接管/重跑迟到/重启恢复）
   test_impact.py      14 个影响闭包测试（传播/强制节点/排除冲突/环/缺节点/超大闭包/动态门禁/并发单当前版本）
+  test_isolation.py   23 个事故隔离不变量（谱系熔断/不可信父版本门禁/同谱系原子并发/幂等/崩溃续裁/双角色无分叉恢复/旧结果旧签核不跨代次）
   test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
   test_envelope.py       9 个发布信封领域不变量（并发同内容、续传、撤权、签名者/根密钥轮换、篡改、恢复/同名冲突）
   test_envelope_api.py   2 个真实 HTTP 端到端测试（双签发布离线验真、分块续传页面）
@@ -150,23 +189,30 @@ tests/
 
 ```
 DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RELEASING ──阶段2──▶ RELEASED
-  │                           │ ▲                                      
-  │                           │ │ rebase(refreeze, epoch+1)            
-  │      基础约束更新          ▼ │                                      
-  │                    REBASE_REQUIRED                                  
-  │ freeze(模块被占)                                                      
+  │                           │ ▲                                       │
+  │                           │ │ rebase(refreeze, epoch+1)             │ 事故隔离命中：
+  │      基础约束更新          ▼ │                                       ▼ RELEASED 版本及后代
+  │                    REBASE_REQUIRED                              UNTRUSTED（信任覆盖层）
+  │ freeze(模块被占)
   ├──────────────────────▶ QUEUED ──合并裁决──▶ (源)MERGED / (目标留在 FROZEN, epoch+1)
-  └──abort─▶ ABORTED        │                                           
-        阻塞解除且未被合并 ──┴──▶ REBASE_REQUIRED（必须基于最新基线重冻结）
+  └──abort─▶ ABORTED        │
+        阻塞解除且未被合并 ──┴──▶ REBASE_REQUIRED（必须基于最新/可信基线重冻结）
+
+事故隔离：命中谱系上的 FROZEN/QUEUED/REBASE_REQUIRED（及 RELEASING→熔断 FAILED）
+          ──▶ REBASE_REQUIRED + preferred_parent=最近可信祖先；隔离/恢复令隔离代次 +1，
+          旧检查 SUPERSEDED、旧签核失效；新代次须重跑重签（旧结果/旧签核不跨代次复用）
 ```
 
 ## REST API 摘要
 
 详见 [API.md](API.md)。主要端点：
 
-- `POST /api/ecos` · `POST /api/ecos/{id}/freeze|abort|signoff|release|release/resume`
+- `POST /api/ecos` · `POST /api/ecos/{id}/freeze|abort|signoff|release|release/resume|realign`
 - `GET  /api/ecos/{id}/checks/{type}/inputs`（Runner 拉冻结输入）
 - `POST /api/ecos/{id}/checks/{type}/results|rerun`
+- 已发行版本事故隔离：`POST /api/isolation/incidents` · `POST /api/isolation/restore` ·
+  `POST /api/isolation/quarantines/{id}/resume` ·
+  `GET /api/isolation/board|incidents|quarantines|audit`（操作页 `/isolation`）
 - 验证执行租约：`POST /api/leases/claims` ·
   `POST /api/leases/runs/{run_id}/renew|complete|takeover|release` ·
   `GET  /api/leases/board|audit|runs/{run_id}`（操作页 `/ops`）

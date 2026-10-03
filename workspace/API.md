@@ -18,6 +18,35 @@
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
 
+### 已发行版本事故隔离（信任熔断 / 恢复）
+
+- **版本信任态**：`TRUSTED / UNTRUSTED`。命中版本及其全部后代（沿 `parent_id` 闭包）
+  在隔离提交时标 `UNTRUSTED`；信任覆盖 `baseline_trust` 不可变，每代次一行，
+  无覆盖的基线沿父链继承（`B-R0` 恒可信）。
+- **隔离代次 isolation_generation**：每次隔离/恢复提交 +1 并进入冻结快照指纹
+  （`snapshot.trust_context`）；旧检查结果与旧签核绑定其代次，**不跨代次复用**。
+- **裁决状态**：`QUARANTINING → QUARANTINED`、`RESTORING → RESTORED`；
+  被隔离熔断的发行 `release.state=FAILED`。
+- 拒收原因 reason：
+  - `PARENT_BASELINE_QUARANTINED` 冻结时父版本已不可信（响应带 `realign_to` 最近可信祖先）
+  - `LINEAGE_QUARANTINED` 发行时父谱系不可信 / 纵深防御
+  - `ISOLATION_IN_PROGRESS` 谱系上有进行中的隔离/恢复裁决，发行需等待
+  - `RELEASE_ABORTED_BY_QUARANTINE` 进行中发行被并发隔离 fail-closed 熔断（ECO 转待重新对齐）
+  - `RELEASE_ABORTED` 被熔断的发布不可 resume
+  - `REALIGN_TARGET_UNTRUSTED` 重新对齐目标不是当前可信祖先
+  - `EVIDENCE_REQUIRED` / `BAD_EVIDENCE` 事故缺少合规证据（每条须 `{kind, ref, note?}`）
+  - `DUAL_ROLE_CONFIRM_REQUIRED` 恢复缺少质量/发行双角色确认
+  - `DUAL_ROLE_CONFLICT` 恢复的两个确认角色为同一自然人
+  - `LINEAGE_FORKED_SINCE_QUARANTINE` 隔离期间可信祖先上出现修复分叉（带
+    `fork_baseline_id / trusted_anchor / quarantined_at / forked_at`），禁止朴素恢复
+  - `LINEAGE_ALREADY_QUARANTINED` 命中版本已不可信且无对应已登记事故
+  - `RESTORE_TARGET_MUST_BE_ROOT` 恢复必须针对事故命中根版本（整条谱系一并恢复）
+  - `QUARANTINE_INTERRUPTED` / `RESTORE_INTERRUPTED` 阶段1后崩溃（failpoint 注入，可续裁）
+- **幂等**：登记携带 `request_key`（缺省由请求内容指纹派生），重复到达返回
+  200 `{deduped:true}`，不产生第二次状态迁移；恢复在已可信谱系上同样幂等。
+- **崩溃续裁**：启动自动 `recover()`，把 `QUARANTINING/RESTORING` 续裁完成；
+  恢复续裁时若已分叉则保持中断并记 `RECOVER_BLOCKED`。
+
 ### 电路影响闭包（审核前自动复验分析）
 
 影响闭包基于**版本化电路拓扑**（模块实例、传播边、时钟域、约束引用、强制策略）和
@@ -112,8 +141,9 @@
 |---|---|---|
 | POST | `/api/ecos` | `{title, owner, affected_modules[], edits, root_instances?, change_summary?, compute_impact?}` → 201；默认创建时自动计算影响闭包 |
 | POST | `/api/ecos/{id}/edits` | `{edits, by}` 仅 DRAFT/REBASE_REQUIRED；编辑内容变化会重算当前闭包 |
-| POST | `/api/ecos/{id}/freeze` | `{by}` 先校验影响闭包仍为当前版本；冲突时转 QUEUED，否则冻结+触发矩阵 |
+| POST | `/api/ecos/{id}/freeze` | `{by}` 先校验影响闭包仍为当前版本；冲突时转 QUEUED，否则冻结+触发矩阵；父版本不可信报 `PARENT_BASELINE_QUARANTINED`（带 `realign_to`）|
 | POST | `/api/ecos/{id}/abort` | `{by}` 释放锁并推动排队单晋升 |
+| POST | `/api/ecos/{id}/realign` | `{target_baseline_id, by}` 隔离后重新对齐到可信祖先；目标不可信 409 `REALIGN_TARGET_UNTRUSTED`；QUEUED 单转回 REBASE_REQUIRED |
 | GET | `/api/ecos` / `/api/ecos/{id}` | 列表（含门禁/闭包摘要）/ 详情（含 gate/queue/release/impact）|
 | GET | `/api/ecos/{id}/impact` | ECO 绑定的影响闭包快照（候选、边解释、人工排除）|
 
@@ -128,6 +158,30 @@
 | POST | `/api/impact/snapshots/{id}/exclusions` | `{by, exclusions:[{node, reason}]}`；追加人工覆盖版本 |
 | GET | `/api/impact/audit?scope=&snapshot_id=&limit=` | `impact.auto/impact.override/topology.publish` 审计 |
 | 页面 | `/impact` | 拓扑发布、闭包计算、边解释、人工排除和审计操作页 |
+
+### 已发行版本事故隔离
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/isolation/incidents` | `{batch, faulty_baseline_id, reason, evidence:[{kind,ref,note?}], registered_by, request_key?, failpoint?}`；201 新裁决 / 200 `deduped:true` 回放。命中版本及后代标不可信、关联在验 ECO 转 REBASE_REQUIRED、熔断同谱系 RELEASING 发行 |
+| POST | `/api/isolation/restore` | `{faulty_baseline_id, confirms:[{role:QUALITY_LEAD,user},{role:RELEASE_LEAD,user}], restored_by?, request_key?, note?, failpoint?}`；双角色须不同自然人，期间无分叉，成功产生新隔离代次 |
+| POST | `/api/isolation/quarantines/{id}/resume` | `{by?}` 手动续裁中断的隔离/恢复（服务启动已自动 recover）|
+| GET | `/api/isolation/board` | 操作页聚合：`isolation_generation / lineage(含 trust 与 nearest_trusted_ancestor) / untrusted_lineage / current_trunk / pending_changes / incidents / quarantines / open_adjudications / aborted_releases / audit / restore_roles` |
+| GET | `/api/isolation/incidents` / `/incidents/{id}` | 事故列表 / 详情（含其隔离与恢复裁决及双角色确认）|
+| GET | `/api/isolation/quarantines` | 全部两阶段裁决及状态 |
+| GET | `/api/isolation/audit?incident_id=&quarantine_id=&event=&limit=` | 落盘日志：`QUARANTINE_PHASE1_LOCKED/QUARANTINE_PHASE2_COMMITTED/QUARANTINE_RECOVERED/RESTORE_*/RECOVER_BLOCKED` |
+| 页面 | `/isolation` | 事故登记、受影响谱系树、可信祖先、待处理变更、双角色恢复、隔离审计 |
+
+事故隔离与新发行并发的裁决时序（同一谱系）：
+
+```
+release 阶段1 已提交 RELEASING（可崩溃） ──┐
+                                          ├─ 单事务 BEGIN IMMEDIATE 原子相遇
+quarantine 阶段1 QUARANTINING 落盘 ───────┘
+  → 隔离阶段2：该 RELEASING 单 fail-closed 熔断为 FAILED，ECO 转 REBASE_REQUIRED，
+    preferred_parent=最近可信祖先；resume 报 RELEASE_ABORTED 不救活。
+  → 若隔离仍在 QUARANTINING 未提交：release 阶段2 报 ISOLATION_IN_PROGRESS。
+崩溃在任一阶段1之后：启动 recover() 从 isolation_journal 续裁，结果确定且无部分态。
+```
 
 ### 验证（Runner 协议）
 | 方法 | 路径 | 说明 |

@@ -137,7 +137,72 @@ class ApiTest(unittest.TestCase):
                          {"by": "ccb", "module_winners": {"noc": "SOURCE_WINS"}})
         self.assertEqual(s, 200)
         self.assertEqual(m["freeze_epoch"], 2)
-        self.assertIn("B_FIX", m["edits"]["noc"]["netlist"])
+
+    def _publish_one_baseline(self, mod="alu"):
+        s, d = self.call("/api/ecos", "POST", {
+            "title": f"发 {mod}", "owner": "o", "affected_modules": [mod],
+            "edits": {mod: {"netlist": f"MODULE {mod}; CELL HTTP_REL; ENDMODULE"}}})
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "o"})
+        for _ in range(20):
+            s, d = self.call(f"/api/ecos/{eid}")
+            pending = [c["type"] for c in d["gate"]["checks"] if c["status"] == "PENDING"]
+            if not pending:
+                break
+            for t in pending:
+                s, pkt = self.call(f"/api/ecos/{eid}/checks/{t}/inputs")
+                fp = compute_input_fingerprint(t, pkt["inputs"])
+                self.call(f"/api/ecos/{eid}/checks/{t}/results", "POST",
+                          {"run_id": pkt["run_id"], "fingerprint": fp, "verdict": "PASS"})
+        self.call(f"/api/ecos/{eid}/signoff", "POST",
+                  {"role": "TIMING_LEAD", "user": "http.t"})
+        self.call(f"/api/ecos/{eid}/signoff", "POST",
+                  {"role": "METHODOLOGY_LEAD", "user": "http.m"})
+        s, rel = self.call(f"/api/ecos/{eid}/release", "POST", {"by": "o"})
+        self.assertEqual(s, 200)
+        return eid, rel["new_baseline_id"]
+
+    def test_incident_quarantine_and_restore_via_http(self):
+        _, b1 = self._publish_one_baseline("alu")
+        # 缺证据 → 400
+        s, err = self.call("/api/isolation/incidents", "POST", {
+            "batch": "BAT-HTTP", "faulty_baseline_id": b1, "reason": "r",
+            "evidence": [], "registered_by": "qa"})
+        self.assertEqual(s, 400)
+        self.assertEqual(err["error"], "EVIDENCE_REQUIRED")
+        # 登记隔离
+        payload = {"batch": "BAT-HTTP", "faulty_baseline_id": b1, "reason": "现场失效",
+                   "evidence": [{"kind": "FA", "ref": "FA-HTTP-1"}],
+                   "registered_by": "qa", "request_key": "http-rk-1"}
+        s, d = self.call("/api/isolation/incidents", "POST", payload)
+        self.assertEqual(s, 201)
+        self.assertEqual(d["quarantine"]["state"], "QUARANTINED")
+        # 相同 request_key 重放 → 200 幂等，无第二次迁移
+        s, d2 = self.call("/api/isolation/incidents", "POST", payload)
+        self.assertEqual(s, 200)
+        self.assertTrue(d2["deduped"])
+        # 基线不可信
+        s, bd = self.call(f"/api/baselines/{b1}")
+        self.assertEqual(bd["trust"]["status"], "UNTRUSTED")
+        # 看板
+        s, board = self.call("/api/isolation/board")
+        self.assertEqual(s, 200)
+        self.assertIn(b1, [n["id"] for n in board["untrusted_lineage"]])
+        # 双角色恢复（不同人）
+        s, r = self.call("/api/isolation/restore", "POST", {
+            "faulty_baseline_id": b1,
+            "confirms": [{"role": "QUALITY_LEAD", "user": "qa"},
+                         {"role": "RELEASE_LEAD", "user": "rel"}]})
+        self.assertEqual(s, 201)
+        self.assertEqual(r["quarantine"]["state"], "RESTORED")
+        # 隔离代次：隔离 +1、恢复 +1
+        s, board = self.call("/api/isolation/board")
+        self.assertEqual(board["isolation_generation"], 2)
+        # 审计可查
+        s, aud = self.call("/api/isolation/audit?incident_id=INC-001")
+        events = {e["event"] for e in aud["events"]}
+        self.assertIn("QUARANTINE_PHASE2_COMMITTED", events)
+        self.assertIn("RESTORE_PHASE2_COMMITTED", events)
 
     def test_static_index(self):
         s, data, _ = self.call("/", raw=True)

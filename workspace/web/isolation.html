@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>已发行版本事故隔离 · 质量操作页</title>
+<style>
+  :root { --bg:#0f1522; --panel:#182030; --line:#2a3550; --txt:#dbe4f3;
+          --mut:#8494b3; --ok:#2fbf71; --bad:#e0556b; --warn:#e3a73a;
+          --accent:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",monospace;
+         background:var(--bg); color:var(--txt); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:14px; background:#121a29; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { color:var(--mut); font-size:12px; }
+  a { color:var(--accent); text-decoration:none; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:5px;
+           padding:5px 11px; cursor:pointer; font-size:12px; }
+  button.sec { background:#2c3a55; } button.danger{background:var(--bad);}
+  button:disabled { background:#333d52; color:#7c88a1; cursor:not-allowed; }
+  input,textarea,select { background:#0d1320; color:var(--txt); border:1px solid var(--line);
+           border-radius:4px; padding:5px 8px; font-size:12px; font-family:inherit; }
+  textarea { width:100%; min-height:54px; }
+  .wrap { padding:14px 22px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:#9fb4da; letter-spacing:1px;
+              text-transform:uppercase; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; }
+  .t-TRUSTED{background:#155a38;color:#bdf3d5}
+  .t-UNTRUSTED{background:#5a2030;color:#f3c3cd}
+  .s-QUARANTINED{background:#5a2030;color:#f3c3cd}
+  .s-QUARANTINING,.s-RESTORING{background:#5c441e;color:#ffe2b0}
+  .s-RESTORED{background:#155a38;color:#bdf3d5}
+  .chip { font-size:11px; padding:1px 7px; border:1px solid var(--line); border-radius:20px;color:var(--mut);}
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td,th { padding:4px 6px; border-bottom:1px solid #222d44; text-align:left; vertical-align:top;}
+  th { color:var(--mut); font-weight:600; }
+  .mut{color:var(--mut)} .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  #toast { position:fixed; right:18px; bottom:18px; max-width:520px; display:flex;
+           flex-direction:column; gap:8px; z-index:9; }
+  .toast { padding:9px 13px; border-radius:7px; background:#20304d; border:1px solid var(--line);
+           font-size:12px; } .toast.err{border-color:var(--bad);} .toast.ok{border-color:var(--ok);}
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .tree { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.9; }
+  .tree .node { padding-left:0; }
+  .indent { margin-left:22px; border-left:1px dashed #2a3550; padding-left:14px; }
+  label { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚧 已发行版本事故隔离 · 质量操作页</h1>
+  <span class="meta" id="meta"></span>
+  <span style="flex:1"></span>
+  <a class="chip" href="/">签核工作台</a>
+  <a class="chip" href="/ops">Runner 租约</a>
+  <a class="chip" href="/impact">影响闭包</a>
+  <button class="sec" onclick="refresh()">立即刷新</button>
+  <label class="mut"><input type="checkbox" id="autoref" checked/> 5s 自动刷新</label>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <div class="panel">
+      <h2>① 质量负责人登记事故并隔离</h2>
+      <div class="row">
+        <label>故障批次 <input id="batch" placeholder="BAT-2026-09-…" style="width:150px"/></label>
+        <label>命中（已发行）版本
+          <select id="faulty" style="width:120px"></select></label>
+      </div>
+      <div class="row mut">事故必须随至少一条证据（类型 + 定位引用）：</div>
+      <div class="row">
+        <input id="evKind" placeholder="证据类型 FA/8D/RMA" style="width:150px"/>
+        <input id="evRef" placeholder="引用/定位 FA-778 / log://…" style="width:230px"/>
+        <input id="evNote" placeholder="说明（可选）" style="width:200px"/>
+        <button class="sec" onclick="addEvidence()">加入证据</button>
+      </div>
+      <div id="evidence"></div>
+      <div class="row"><label>故障原因</label></div>
+      <textarea id="reason" placeholder="失效机理 / 根因描述"></textarea>
+      <div class="row">
+        <label>质量负责人 <input id="qa" value="qa.lead" style="width:120px"/></label>
+        <label>幂等键 <input id="rk" style="width:220px" placeholder="留空则按请求内容指纹派生"/></label>
+        <button class="sec" onclick="genRk()">生成幂等键</button>
+      </div>
+      <div class="row mut">相同事故请求重复到达只回放首次裁决，不产生第二次状态迁移。</div>
+      <div class="row"><button class="danger" onclick="registerIncident()">登记并隔离命中谱系</button></div>
+    </div>
+
+    <div class="panel">
+      <h2>② 双角色恢复可信状态</h2>
+      <div class="row mut">恢复需<b>质量负责人 + 发行负责人两个不同自然人</b>确认，
+        且谱系在隔离期间<b>未发生新分叉</b>；恢复产生新隔离代次，旧检查/旧签核一律不复用。</div>
+      <div class="row">
+        <label>恢复目标版本 <select id="restoreTarget" style="width:130px"></select></label>
+        <label>质量负责人 <input id="confQa" value="qa.lead" style="width:110px"/></label>
+        <label>发行负责人 <input id="confRel" value="release.lead" style="width:110px"/></label>
+      </div>
+      <div class="row"><label>说明</label> <input id="restoreNote" style="width:380px"
+        placeholder="根因已消除 / 修复验证批次…"/></div>
+      <div class="row"><button onclick="restoreTrust()">提交双角色恢复确认</button></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>③ 受影响版本谱系（命中版本及其全部后代 = 不可信；可信祖先可作重新对齐锚点）</h2>
+    <div class="row">
+      <span class="chip">当前隔离代次 <b id="gen"></b></span>
+      <span class="chip">当前 trunk <b id="trunk"></b></span>
+      <span id="trunkTrust"></span>
+      <span class="mut">绿色=可信，红色=事故隔离不可信。</span>
+    </div>
+    <div id="tree" class="tree"></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>④ 当前可信祖先（重新对齐锚点）</h2>
+      <div id="anchors"></div>
+    </div>
+    <div class="panel">
+      <h2>⑤ 待处理变更（隔离后转回待重新对齐）</h2>
+      <div id="pending"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>⑥ 事故与隔离/恢复裁决</h2>
+      <div id="incidents"></div>
+    </div>
+    <div class="panel">
+      <h2>⑦ 隔离审计（落盘日志 / 熔断 / 恢复）</h2>
+      <div id="audit"></div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="/static/isolation.js"></script>
+</body>
+</html>

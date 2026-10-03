@@ -16,6 +16,7 @@ from .service import ECOError, ECOService
 from .store import Store
 from .impact import ImpactService
 from .leases import LeaseError, LeaseService
+from .isolation import IsolationError, IsolationService
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -24,9 +25,11 @@ _MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; ch
 
 
 def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
-                  impact_svc: ImpactService | None = None):
+                  impact_svc: ImpactService | None = None,
+                  iso_svc: IsolationService | None = None):
     lease_svc = lease_svc or LeaseService(svc.s, svc)
     impact_svc = impact_svc or ImpactService(svc.s)
+    iso_svc = iso_svc or IsolationService(svc.s, svc)
     class Handler(BaseHTTPRequestHandler):
         server_version = "ChipECO/1.0"
 
@@ -90,6 +93,8 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                     return self._static("ops.html")
                 if path == "/impact":
                     return self._static("impact.html")
+                if path == "/isolation":
+                    return self._static("isolation.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
                 # 更具体的字面路径先于参数化模式匹配
@@ -144,6 +149,21 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                     return self._send(200, d["impact"])
                 if path == "/api/rejected-results":
                     return self._send(200, {"rejected": svc.rejected_results()})
+                # ---- 已发行版本事故隔离 ----
+                if path == "/api/isolation/board":
+                    return self._send(200, iso_svc.board())
+                if path == "/api/isolation/incidents":
+                    return self._send(200, {"incidents": iso_svc.list_incidents()})
+                if path == "/api/isolation/quarantines":
+                    return self._send(200, {"quarantines": iso_svc.list_quarantines()})
+                if path == "/api/isolation/audit":
+                    return self._send(200, iso_svc.audit_events(
+                        incident_id=self._q("incident_id"),
+                        quarantine_id=self._q("quarantine_id"),
+                        event=self._q("event"), limit=self._q("limit", 200, int)))
+                m = re.fullmatch(r"/api/isolation/incidents/([^/]+)", path)
+                if m:
+                    return self._send(200, iso_svc.incident_detail(m.group(1)))
                 if path == "/api/admin/delegations":
                     return self._send(200, {"delegations": svc.list_delegations()})
                 m = re.fullmatch(r"/api/admin/delegations/(\d+)", path)
@@ -188,6 +208,10 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                 m = re.fullmatch(r"/api/ecos/([^/]+)/abort", path)
                 if m:
                     return self._send(200, svc.abort_eco(m.group(1), b.get("by", "?")))
+                m = re.fullmatch(r"/api/ecos/([^/]+)/realign", path)
+                if m:
+                    return self._send(200, svc.realign_eco(
+                        m.group(1), b.get("target_baseline_id"), b.get("by", "?")))
                 m = re.fullmatch(r"/api/ecos/([^/]+)/checks/([^/]+)/results", path)
                 if m:
                     d = svc.submit_result(
@@ -244,6 +268,30 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                 if m:
                     return self._send(201, impact_svc.exclude(
                         m.group(1), b.get("exclusions", []), b.get("by", "?")))
+                # ---- 已发行版本事故隔离（质量负责人登记/隔离、双角色恢复、续裁）----
+                if path == "/api/isolation/incidents":
+                    d = iso_svc.register_incident(
+                        batch=b.get("batch"), faulty_baseline_id=b.get("faulty_baseline_id"),
+                        reason=b.get("reason"), evidence=b.get("evidence"),
+                        registered_by=b.get("registered_by", b.get("by", "?")),
+                        request_key=b.get("request_key"), failpoint=b.get("failpoint"))
+                    return self._send(200 if d.get("deduped") else 201, d)
+                if path == "/api/isolation/restore":
+                    d = iso_svc.restore_trust(
+                        faulty_baseline_id=b.get("faulty_baseline_id"),
+                        confirms=b.get("confirms"), restored_by=b.get("restored_by", b.get("by")),
+                        request_key=b.get("request_key"), failpoint=b.get("failpoint"),
+                        note=b.get("note", ""))
+                    return self._send(200 if d.get("deduped") else 201, d)
+                m = re.fullmatch(r"/api/isolation/quarantines/([^/]+)/resume", path)
+                if m:
+                    qid = m.group(1)
+                    qrow = svc.s.q_one("SELECT kind FROM quarantine WHERE id=?", (qid,))
+                    if not qrow:
+                        raise ECOError("QUARANTINE_NOT_FOUND", f"裁决 {qid} 不存在", 404)
+                    return self._send(200, (iso_svc.quarantine_finish(qid, b.get("by", "system"))
+                                            if qrow["kind"] == "QUARANTINE"
+                                            else iso_svc.restore_finish(qid, b.get("by", "system"))))
                 # ---- 验证执行租约协调（独立 API）----
                 if path == "/api/leases/claims":
                     d = lease_svc.claim(
@@ -288,13 +336,20 @@ def serve(db_path=":memory:", port=8080, lease_ttl_seconds=600):
     # 进程启动：恢复未过期租约，回收已过期租约（落盘租约跨重启存活）
     rec = lease_svc.recover()
     impact_svc = ImpactService(store)
+    iso_svc = IsolationService(store, svc)
+    # 进程启动：从落盘日志续裁未完成的事故隔离 / 可信恢复裁决
+    iso_rec = iso_svc.recover()
     httpd = ThreadingHTTPServer(
-        ("0.0.0.0", port), _make_handler(svc, lease_svc, impact_svc))
+        ("0.0.0.0", port), _make_handler(svc, lease_svc, impact_svc, iso_svc))
     print(f"ECO 基线服务已启动: http://localhost:{port}  (db={db_path})")
     print(f"租约协调: 恢复未过期 {rec['restored_held']} 条，回收过期 {len(rec['recovered_expired'])} 条，"
           f"对账 {rec['reconciled']} 条")
+    if iso_rec["resumed"] or iso_rec["blocked"]:
+        print(f"事故隔离: 续裁 {iso_rec['resumed']} 个，阻塞 {iso_rec['blocked']}，"
+              f"当前隔离代次 {iso_rec['generation']}")
     print(f"Runner 操作页: http://localhost:{port}/ops")
     print(f"电路影响闭包操作页: http://localhost:{port}/impact")
+    print(f"事故隔离操作页: http://localhost:{port}/isolation")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -67,8 +67,8 @@ def matrix_catalog():
 
 
 def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: str = "",
-                   impact: dict | None = None):
-    """构造不可变冻结快照：网表 + 约束 + 受影响模块 + 验证矩阵 + 影响闭包。"""
+                   impact: dict | None = None, trust: dict | None = None):
+    """构造不可变冻结快照：网表 + 约束 + 受影响模块 + 验证矩阵 + 影响闭包 + 信任代次。"""
     return {
         "schema": "chip-eco-baseline/1",
         "note": note,
@@ -78,6 +78,7 @@ def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: 
         "modules": copy.deepcopy(modules),
         "verification_matrix": matrix_catalog(),
         "impact_closure": copy.deepcopy(impact) if impact is not None else None,
+        "trust_context": copy.deepcopy(trust) if trust is not None else None,
     }
 
 
@@ -88,6 +89,9 @@ def snapshot_fingerprint(snap: dict) -> str:
         "modules": snap["modules"],
         "verification_matrix": snap["verification_matrix"],
         "impact_closure": snap.get("impact_closure"),
+        # 隔离代次进入指纹：代次一变整体指纹即变，旧签核（overall_fp）自动失配，
+        # 从结构上保证任何旧检查/旧签核都不可能跨隔离代次复用。
+        "trust_context": snap.get("trust_context"),
     })
 
 
@@ -119,7 +123,7 @@ def _eco_dict(row):
     for k in ("affected_modules_json", "edits_json", "snapshot_json", "merge_of_json",
               "impact_input_json"):
         d[k.removesuffix("_json")] = json.loads(d.pop(k)) if d[k] is not None else None
-    return d# ---------------------------------------------------------------- 服务
+    return d
 
 class ECOService:
     def __init__(self, store: Store, now_fn=utcnow):
@@ -174,25 +178,130 @@ class ECOService:
         return _baseline_dict(c.execute(
             "SELECT * FROM baseline WHERE id=?", (t["base_id"],)).fetchone())["snapshot"]
 
+    # ===== 事故隔离：谱系与信任原语（IsolationService 与冻结/发布门禁共用）=====
+    def _iso(self):
+        from .isolation import IsolationService
+        return IsolationService(self.s, self)
+
+    def _baseline_children(self, c):
+        """parent_id -> [子基线]。谱系为以 B-R0 为根的链（隔离期间可能分叉）。"""
+        children: dict[str, list[str]] = {}
+        for r in c.execute("SELECT id,parent_id FROM baseline").fetchall():
+            children.setdefault(r["parent_id"], []).append(r["id"])
+        return children
+
+    def _descendant_baselines(self, c, root_id: str) -> list[str]:
+        """命中版本的全部后代基线（含自身），按 revision 排序。"""
+        if not c.execute("SELECT 1 FROM baseline WHERE id=?", (root_id,)).fetchone():
+            return []
+        children = self._baseline_children(c)
+        found, stack = set(), [root_id]
+        while stack:
+            b = stack.pop()
+            if b in found:
+                continue
+            found.add(b)
+            stack.extend(children.get(b, []))
+        rows = c.execute(
+            f"SELECT id,revision FROM baseline WHERE id IN ({','.join('?' * len(found))})",
+            tuple(found)).fetchall()
+        return [r["id"] for r in sorted(rows, key=lambda x: x["revision"])]
+
+    def _latest_trust(self, c, baseline_id: str):
+        """某基线自身最新的信任覆盖行；无覆盖返回 None（沿父链继承）。"""
+        return c.execute(
+            "SELECT * FROM baseline_trust WHERE baseline_id=? ORDER BY seq DESC LIMIT 1",
+            (baseline_id,)).fetchone()
+
+    def baseline_trust_status(self, c, baseline_id: str) -> dict:
+        """解析某基线当前信任态：自身无覆盖则沿 parent_id 向上继承，R0 恒可信。
+
+        返回 {baseline_id,status,generation,incident_id,via,resolved_from}。
+        """
+        cur, seen = baseline_id, set()
+        while cur:
+            if cur in seen:          # 防御性环检测（正常谱系无环）
+                break
+            seen.add(cur)
+            row = self._latest_trust(c, cur)
+            if row:
+                return {"baseline_id": baseline_id, "status": row["status"],
+                        "generation": row["generation"], "incident_id": row["incident_id"],
+                        "via": row["via"], "by": row["by"], "at": row["at"],
+                        "resolved_from": cur if cur != baseline_id else baseline_id}
+            p = c.execute("SELECT parent_id FROM baseline WHERE id=?", (cur,)).fetchone()
+            if not p:
+                break
+            cur = p["parent_id"]
+        return {"baseline_id": baseline_id, "status": "TRUSTED",
+                "generation": None, "incident_id": None, "via": "ROOT",
+                "by": "system", "at": None, "resolved_from": baseline_id}
+
+    def _is_trusted(self, c, baseline_id: str) -> bool:
+        return self.baseline_trust_status(c, baseline_id)["status"] == "TRUSTED"
+
+    def nearest_trusted_ancestor(self, c, baseline_id: str):
+        """从给定基线（含自身）沿父链找到的最近可信基线；整链皆不可信时返回 None。"""
+        cur, seen = baseline_id, set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            if self._is_trusted(c, cur):
+                return cur
+            p = c.execute("SELECT parent_id FROM baseline WHERE id=?", (cur,)).fetchone()
+            cur = p["parent_id"] if p else None
+        return None
+
+    def post_quarantine_anchor(self, c, faulty_root_id: str):
+        """隔离提交后，命中谱系内任意版本可重新对齐到的最近可信祖先。
+
+        故障根本身及其后代将不可信，因此锚点从故障根的**父版本**（不含故障根）向上解析；
+        若故障根即谱系根 B-R0，则无可信祖先（返回 None，需先在外部建立可信基线）。
+        """
+        row = c.execute("SELECT parent_id FROM baseline WHERE id=?",
+                        (faulty_root_id,)).fetchone()
+        if not row or not row["parent_id"]:
+            return None
+        return self.nearest_trusted_ancestor(c, row["parent_id"])
+
+    def _next_isolation_generation(self, c) -> int:
+        return c.execute("SELECT generation FROM isolation_meta WHERE id=1").fetchone()["generation"]
+
+    def _bump_isolation_generation(self, c) -> int:
+        c.execute("UPDATE isolation_meta SET generation=generation+1 WHERE id=1")
+        return self._next_isolation_generation(c)
+
+    def _open_quarantines(self, c):
+        """进行中的隔离/恢复裁决（两阶段中断态）。"""
+        return c.execute(
+            "SELECT * FROM quarantine WHERE state IN ('QUARANTINING','RESTORING')").fetchall()
+
     # ===== 基线查询 =====
     def list_baselines(self):
         rows = self.s.q_all("SELECT * FROM baseline ORDER BY revision")
         out = []
-        for r in rows:
-            d = _baseline_dict(r)
-            snap = d["snapshot"]
-            out.append({
-                "id": d["id"], "revision": d["revision"], "parent_id": d["parent_id"],
-                "eco_id": d["eco_id"], "created_at": d["created_at"],
-                "fingerprint": d["fingerprint"],
-                "affected_modules": snap["affected_modules"],
-                "constraints_version_note": snap.get("note", ""),
-                "module_count": len(snap["modules"]),
-            })
+        with self.s.lock:
+            for r in rows:
+                d = _baseline_dict(r)
+                snap = d["snapshot"]
+                out.append({
+                    "id": d["id"], "revision": d["revision"], "parent_id": d["parent_id"],
+                    "eco_id": d["eco_id"], "created_at": d["created_at"],
+                    "fingerprint": d["fingerprint"],
+                    "affected_modules": snap["affected_modules"],
+                    "constraints_version_note": snap.get("note", ""),
+                    "module_count": len(snap["modules"]),
+                    "trust": self.baseline_trust_status(self.s.conn, d["id"]),
+                })
         return out
 
     def baseline_detail(self, bid):
-        return self._get_baseline(bid)
+        d = self._get_baseline(bid)
+        with self.s.lock:
+            d["trust"] = self.baseline_trust_status(self.s.conn, bid)
+            d["nearest_trusted_ancestor"] = (
+                bid if d["trust"]["status"] == "TRUSTED"
+                else self.nearest_trusted_ancestor(self.s.conn, bid))
+        return d
 
     def check_catalog(self):
         return {"checks": matrix_catalog()}
@@ -394,22 +503,45 @@ class ECOService:
                 return self.eco_detail(eco_id, c)
 
             trunk = self._trunk(c)
-            base_snap = self._base_snapshot(c)
+            # 父版本必须可信：事故隔离命中谱系禁止继续充当新变更的父版本。
+            # 工程师可用 preferred_parent_id 显式重新对齐到可信祖先；未指定则用 trunk，
+            # trunk 不可信时返回最近可信祖先引导其重新对齐。
+            preferred = eco["preferred_parent_id"] if "preferred_parent_id" in eco.keys() else None
+            parent_id = preferred or trunk["base_id"]
+            parent_row = c.execute("SELECT * FROM baseline WHERE id=?", (parent_id,)).fetchone()
+            if not parent_row:
+                raise ECOError("BASELINE_NOT_FOUND", f"父基线 {parent_id} 不存在", 404)
+            parent_trust = self.baseline_trust_status(c, parent_id)
+            if parent_trust["status"] != "TRUSTED":
+                safe = self.nearest_trusted_ancestor(c, parent_id)
+                raise ECOError(
+                    "PARENT_BASELINE_QUARANTINED",
+                    "父版本已被事故隔离标记为不可信，禁止在该谱系上继续派生新变更；"
+                    "请重新对齐到可信祖先后再冻结", 409,
+                    {"parent_baseline_id": parent_id,
+                     "trust": parent_trust,
+                     "realign_to": safe,
+                     "action": f"POST /api/ecos/{eco_id}/realign"})
+            base_snap = _baseline_dict(parent_row)["snapshot"]
             constraints = json.loads(trunk["working_constraints_json"])
             eff_mods = self._effective_modules(base_snap["modules"], modules, edits)
+            # 当前隔离代次进入快照：旧代次的检查结果与签核不可能在新代次复用。
+            gen = self._next_isolation_generation(c)
+            trust_ctx = {"parent_baseline_id": parent_id,
+                         "isolation_generation": gen}
             snap = build_snapshot(eff_mods, constraints, modules,
-                                 note=f"{eco_id} 冻结于 {trunk['base_id']}",
-                                 impact=impact_payload)
+                                 note=f"{eco_id} 冻结于 {parent_id}",
+                                 impact=impact_payload, trust=trust_ctx)
             fp = snapshot_fingerprint(snap)
             epoch = eco["freeze_epoch"] + 1
             c.execute(
                 "UPDATE eco SET status='FROZEN',submitted_at=COALESCE(submitted_at,?),"
                 "frozen_at=?,parent_baseline_id=?,base_revision_at_freeze=?,"
-                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?"
-                " WHERE id=?",
-                (utcnow(), utcnow(), trunk["base_id"], trunk["base_revision"],
+                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?,"
+                "isolation_generation=? WHERE id=?",
+                (utcnow(), utcnow(), parent_id, parent_row["revision"],
                  trunk["constraints_version"], json.dumps(snap, ensure_ascii=False), fp,
-                 epoch, eco_id))
+                 epoch, gen, eco_id))
             self._supersede_runs(c, eco_id, "refreeze")
             self._void_signoffs(c, eco_id, "ECO refrozen: epoch/fingerprint changed")
             for m in modules:
@@ -1068,6 +1200,76 @@ class ECOService:
             return self.eco_detail(target_eco_id, c)
 
     # ===== 发布（两阶段、可恢复） =====
+    def _quarantine_touches(self, c, faulty_root_id: str, baseline_id: str | None) -> bool:
+        """给定基线是否落在以 faulty_root_id 为根的事故命中谱系（故障根及其后代）内。"""
+        if not baseline_id:
+            return False
+        return baseline_id in self._descendant_baselines(c, faulty_root_id)
+
+    def _abort_release_due_to_quarantine(self, c, eco, q, safe_ancestor=None):
+        """事故隔离 fail-closed 熔断进行中的发布：RELEASING 单转回待重新对齐。
+
+        与隔离裁决处于同一事务（被外层调用）；release 行标 FAILED，resume 将拒绝。
+        safe_ancestor 显式给出重新对齐的可信祖先（故障根的最近可信祖先）；
+        缺省时从 ECO 父版本沿链解析。
+        """
+        c.execute("UPDATE eco SET status='REBASE_REQUIRED' WHERE id=?", (eco["id"],))
+        self._supersede_runs(c, eco["id"], "quarantine aborts in-flight release")
+        self._void_signoffs(c, eco["id"], "release aborted by incident quarantine")
+        safe = safe_ancestor or self.nearest_trusted_ancestor(c, eco["parent_baseline_id"])
+        c.execute("UPDATE eco SET preferred_parent_id=? WHERE id=?", (safe, eco["id"]))
+        c.execute("UPDATE release SET state='FAILED', finished_at=?, failpoint=? WHERE eco_id=?",
+                  (utcnow(), f"ABORTED_BY_QUARANTINE:{q['id']}", eco["id"]))
+        c.execute("DELETE FROM module_lock WHERE eco_id=?", (eco["id"],))
+        c.execute(
+            "INSERT INTO release_journal(eco_id,event,at,detail_json) VALUES(?,?,?,?)",
+            (eco["id"], "ABORTED_BY_QUARANTINE", utcnow(),
+             json.dumps({"quarantine_id": q["id"], "incident_id": q["incident_id"],
+                         "realign_to": safe}, ensure_ascii=False)))
+        c.execute(
+            "INSERT INTO rejected_result(run_id,eco_id,check_type,reason,detail_json,received_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (None, eco["id"], None, "RELEASE_ABORTED_BY_QUARANTINE",
+             json.dumps({"quarantine_id": q["id"], "realign_to": safe}, ensure_ascii=False),
+             utcnow()))
+        self._audit(c, "release.aborted_by_quarantine", eco["id"], "system",
+                    {"quarantine_id": q["id"], "incident_id": q["incident_id"],
+                     "realign_to": safe})
+
+    def realign_eco(self, eco_id: str, target_baseline_id: str | None, by: str) -> dict:
+        """把尚未发行的关联 ECO 重新对齐到可信祖先（隔离后唯一合法的再冻结起点）。
+
+        - 目标基线必须存在且当前可信，否则 409 REALIGN_TARGET_UNTRUSTED；
+        - 非终态 ECO 均可重新对齐；已发行/已合并/已中止的单不可再对齐。
+        排队单重新对齐后转回 REBASE_REQUIRED，解除被命中谱系的阻塞关系。
+        """
+        with self.s.tx() as c:
+            eco = self._get_eco(eco_id)
+            if eco["status"] in ("RELEASED", "MERGED", "ABORTED"):
+                raise ECOError("NOT_REALIGNABLE",
+                               f"状态 {eco['status']} 的 ECO 不可重新对齐", 409)
+            if target_baseline_id:
+                row = c.execute("SELECT 1 FROM baseline WHERE id=?",
+                                (target_baseline_id,)).fetchone()
+                if not row:
+                    raise ECOError("BASELINE_NOT_FOUND",
+                                   f"基线 {target_baseline_id} 不存在", 404)
+                t = self.baseline_trust_status(c, target_baseline_id)
+                if t["status"] != "TRUSTED":
+                    raise ECOError("REALIGN_TARGET_UNTRUSTED",
+                                   "只能重新对齐到当前可信的祖先版本", 409,
+                                   {"target": target_baseline_id, "trust": t})
+            c.execute("UPDATE eco SET preferred_parent_id=? WHERE id=?",
+                      (target_baseline_id, eco_id))
+            if eco["status"] == "QUEUED":
+                c.execute("UPDATE eco SET status='REBASE_REQUIRED' WHERE id=?", (eco_id,))
+                c.execute("UPDATE queue_entry SET resolved_at=?, resolution='AUTO_PROMOTE' "
+                          "WHERE eco_id=? AND resolved_at IS NULL", (utcnow(), eco_id))
+            self._audit(c, "eco.realign", eco_id, by,
+                        {"target_baseline_id": target_baseline_id,
+                         "previous_parent_id": eco["parent_baseline_id"]})
+            return self.eco_detail(eco_id, c)
+
     def release_start(self, eco_id, by, failpoint=None):
         with self.s.tx() as c:
             eco = self._get_eco(eco_id)
@@ -1086,6 +1288,21 @@ class ECOService:
                 raise ECOError("NOT_RELEASABLE",
                               "门禁未全绿或双角色签核不全，拒绝发布", 409,
                               {"green": g["green"], "dual": g["dual_role_complete"]})
+            # 发行前门禁：父版本必须可信，且谱系上不得有进行中的隔离/恢复裁决
+            if not self._is_trusted(c, eco["parent_baseline_id"]):
+                t = self.baseline_trust_status(c, eco["parent_baseline_id"])
+                raise ECOError("LINEAGE_QUARANTINED",
+                               f"父版本 {eco['parent_baseline_id']} 已不可信，禁止发行", 409,
+                               {"trust": t,
+                                "realign_to": self.nearest_trusted_ancestor(
+                                    c, eco["parent_baseline_id"])})
+            for q in self._open_quarantines(c):
+                if self._quarantine_touches(c, q["faulty_baseline_id"], eco["parent_baseline_id"]):
+                    raise ECOError(
+                        "ISOLATION_IN_PROGRESS",
+                        f"该谱系上存在进行中的{('隔离' if q['kind']=='QUARANTINE' else '可信恢复')}"
+                        f"裁决 {q['id']}，发行需等待裁决落盘", 409,
+                        {"quarantine_id": q["id"], "kind": q["kind"]})
             c.execute("UPDATE eco SET status='RELEASING' WHERE id=?", (eco_id,))
             c.execute(
                 "INSERT INTO release(eco_id,state,started_at,failpoint) VALUES(?,?,?,?)",
@@ -1110,9 +1327,39 @@ class ECOService:
                 raise ECOError("NO_RELEASE", "该 ECO 没有进行中的发布", 409)
             if rel["state"] == "PUBLISHED":
                 return {"status": "ALREADY_PUBLISHED", "new_baseline_id": rel["new_baseline_id"]}
+            if rel["state"] == "FAILED":
+                raise ECOError("RELEASE_ABORTED",
+                               "该发布已被事故隔离熔断，ECO 需重新对齐可信祖先后重冻结重签",
+                               409, {"failpoint": rel["failpoint"]})
             eco = self._get_eco(eco_id)
             if eco["status"] != "RELEASING":
                 raise ECOError("BAD_STATE", f"ECO 状态 {eco['status']} 异常", 409)
+            # ---- 隔离与新发行并发：同一谱系原子裁决（本事务 BEGIN IMMEDIATE 串行化）----
+            for q in self._open_quarantines(c):
+                if self._quarantine_touches(c, q["faulty_baseline_id"], eco["parent_baseline_id"]):
+                    if q["kind"] == "QUARANTINE":
+                        # 事故隔离进行中：fail-closed，直接熔断该发布（确定性裁决，非 409 等待）
+                        safe = self.post_quarantine_anchor(c, q["faulty_baseline_id"])
+                        self._abort_release_due_to_quarantine(c, eco, q, safe)
+                        raise ECOError(
+                            "RELEASE_ABORTED_BY_QUARANTINE",
+                            f"发布被并发事故隔离 {q['id']} 熔断：父谱系 {eco['parent_baseline_id']} "
+                            "命中事故，ECO 已转回待重新对齐", 409,
+                            {"quarantine_id": q["id"], "incident_id": q["incident_id"],
+                             "faulty_baseline_id": q["faulty_baseline_id"]})
+                    raise ECOError(
+                        "TRUST_RESTORE_IN_PROGRESS",
+                        "谱系可信恢复裁决进行中，发布需等待恢复完成", 409,
+                        {"quarantine_id": q["id"]})
+            # 纵深防御：父谱系在阶段1后被隔离（即使无两阶段记录也拒绝带不可信父版本发行）
+            if not self._is_trusted(c, eco["parent_baseline_id"]):
+                t = self.baseline_trust_status(c, eco["parent_baseline_id"])
+                raise ECOError(
+                    "LINEAGE_QUARANTINED",
+                    f"父版本 {eco['parent_baseline_id']} 已不可信，禁止在其上发行新基线",
+                    409, {"trust": t,
+                          "realign_to": self.nearest_trusted_ancestor(
+                              c, eco["parent_baseline_id"])})
             # 恢复时重新验证：中断期间不允许任何变更（约束更新/中止均被拒绝），这里是纵深防御
             self._impact_svc().assert_snapshot_usable(c, eco["impact_snapshot_id"])
             g = self.gate(eco, c)
@@ -1127,6 +1374,14 @@ class ECOService:
                 "fingerprint,published_by) VALUES(?,?,?,?,?,?,?,?)",
                 (new_id, rev, eco["parent_baseline_id"], utcnow(), eco_id,
                  json.dumps(snap, ensure_ascii=False), eco["fingerprint"], by))
+            # 新基线继承父版本当前信任态与隔离代次（正常路径父可信 → TRUSTED）；
+            # 绝不从不可信父版本发行出新的“可信”基线。
+            ptrust = self.baseline_trust_status(c, eco["parent_baseline_id"])
+            c.execute(
+                "INSERT INTO baseline_trust(baseline_id,status,generation,incident_id,via,by,at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (new_id, ptrust["status"], self._next_isolation_generation(c),
+                 ptrust["incident_id"], "RELEASE", by, utcnow()))
             c.execute("UPDATE trunk SET base_id=?, base_revision=? WHERE id=1",
                       (new_id, rev))
             c.execute("UPDATE eco SET status='RELEASED' WHERE id=?", (eco_id,))
@@ -1178,6 +1433,13 @@ class ECOService:
                 (eco_id,)).fetchall()]
             rel = conn.execute("SELECT * FROM release WHERE eco_id=?", (eco_id,)).fetchone()
             d["release"] = dict(rel) if rel else None
+            if eco["parent_baseline_id"]:
+                d["parent_trust"] = self.baseline_trust_status(conn, eco["parent_baseline_id"])
+                d["nearest_trusted_ancestor"] = self.nearest_trusted_ancestor(
+                    conn, eco["parent_baseline_id"])
+            else:
+                d["parent_trust"] = None
+                d["nearest_trusted_ancestor"] = None
             impact_row = conn.execute("SELECT * FROM impact_snapshot WHERE id=?",
                                       (eco["impact_snapshot_id"],)).fetchone()
             if impact_row:
