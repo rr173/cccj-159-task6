@@ -67,12 +67,13 @@ def matrix_catalog():
 
 
 def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: str = "",
-                   impact: dict | None = None):
+                   impact: dict | None = None, trust_generation: int = 0):
     """构造不可变冻结快照：网表 + 约束 + 受影响模块 + 验证矩阵 + 影响闭包。"""
     return {
         "schema": "chip-eco-baseline/1",
         "note": note,
         "frozen_at": utcnow(),
+        "trust_generation": trust_generation,
         "affected_modules": sorted(affected),
         "constraints": constraints,
         "modules": copy.deepcopy(modules),
@@ -83,6 +84,7 @@ def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: 
 
 def snapshot_fingerprint(snap: dict) -> str:
     return fp_json({
+        "trust_generation": snap.get("trust_generation", 0),
         "affected_modules": snap["affected_modules"],
         "constraints": snap["constraints"],
         "modules": snap["modules"],
@@ -93,7 +95,8 @@ def snapshot_fingerprint(snap: dict) -> str:
 
 def scope_fingerprint(snap: dict, scopes: list[str]) -> str:
     """检查只对其作用域内的冻结输入负责；矩阵恒为输入的一部分。"""
-    obj: dict = {"verification_matrix": snap["verification_matrix"]}
+    obj: dict = {"verification_matrix": snap["verification_matrix"],
+                 "trust_generation": snap.get("trust_generation", 0)}
     if "netlist" in scopes:
         obj["modules"] = {
             m: {"netlist": d["netlist"], "version": d["version"]}
@@ -174,6 +177,47 @@ class ECOService:
         return _baseline_dict(c.execute(
             "SELECT * FROM baseline WHERE id=?", (t["base_id"],)).fetchone())["snapshot"]
 
+    def _active_trust_generation(self, c) -> int:
+        """当前信任代次：活动隔离代次与 trunk 恢复代次中的较高者。"""
+        row = c.execute(
+            "SELECT COALESCE(MAX(generation),0) g FROM quarantine_baseline "
+            "WHERE trust_status='UNTRUSTED'").fetchone()
+        active = int(row["g"] or 0)
+        trunk = self._trunk(c)
+        base = c.execute("SELECT trust_generation FROM baseline WHERE id=?",
+                         (trunk["base_id"],)).fetchone()
+        return max(active, int(base["trust_generation"] or 0) if base else 0)
+
+    def _baseline_trust(self, c, baseline_id: str | None):
+        if not baseline_id:
+            return {"trusted": False, "incidents": [], "trust_generation": 0}
+        rows = c.execute(
+            "SELECT incident_id,generation FROM quarantine_baseline "
+            "WHERE baseline_id=? AND trust_status='UNTRUSTED' ORDER BY incident_id",
+            (baseline_id,)).fetchall()
+        row = c.execute("SELECT trust_generation FROM baseline WHERE id=?",
+                        (baseline_id,)).fetchone()
+        return {"trusted": not rows,
+                "incidents": [r["incident_id"] for r in rows],
+                "trust_generation": row["trust_generation"] if row else 0}
+
+    def _assert_no_pending_quarantine(self, c):
+        row = c.execute(
+            "SELECT id FROM quarantine_incident WHERE status='PENDING' ORDER BY created_at,id LIMIT 1"
+        ).fetchone()
+        if row:
+            raise ECOError("QUARANTINE_PENDING",
+                           "同一谱系有事故隔离裁决待完成，新发行必须等待原子裁决", 409,
+                           {"incident_id": row["id"]})
+
+    def _assert_baseline_trusted(self, c, baseline_id: str | None, at: str = "parent"):
+        trust = self._baseline_trust(c, baseline_id)
+        if not trust["trusted"]:
+            raise ECOError("PARENT_BASELINE_QUARANTINED",
+                           f"{at} 基线 {baseline_id} 已被事故隔离，禁止继续作为可信父版本", 409,
+                           {"baseline_id": baseline_id, "incidents": trust["incidents"]})
+        return trust
+
     # ===== 基线查询 =====
     def list_baselines(self):
         rows = self.s.q_all("SELECT * FROM baseline ORDER BY revision")
@@ -181,10 +225,13 @@ class ECOService:
         for r in rows:
             d = _baseline_dict(r)
             snap = d["snapshot"]
+            trust = self._baseline_trust(self.s.conn, d["id"])
             out.append({
                 "id": d["id"], "revision": d["revision"], "parent_id": d["parent_id"],
                 "eco_id": d["eco_id"], "created_at": d["created_at"],
-                "fingerprint": d["fingerprint"],
+                "fingerprint": d["fingerprint"], "trusted": trust["trusted"],
+                "active_incidents": trust["incidents"],
+                "trust_generation": d.get("trust_generation", 0),
                 "affected_modules": snap["affected_modules"],
                 "constraints_version_note": snap.get("note", ""),
                 "module_count": len(snap["modules"]),
@@ -192,7 +239,10 @@ class ECOService:
         return out
 
     def baseline_detail(self, bid):
-        return self._get_baseline(bid)
+        d = self._get_baseline(bid)
+        with self.s.lock:
+            d["trust"] = self._baseline_trust(self.s.conn, bid)
+        return d
 
     def check_catalog(self):
         return {"checks": matrix_catalog()}
@@ -208,6 +258,9 @@ class ECOService:
         if not title or not owner:
             raise ECOError("BAD_REQUEST", "title/owner 必填", 400)
         with self.s.tx() as c:
+            trunk = self._trunk(c)
+            self._assert_no_pending_quarantine(c)
+            self._assert_baseline_trusted(c, trunk["base_id"], "当前 trunk")
             base = self._base_snapshot(c)
             unknown = [m for m in affected_modules if m not in base["modules"]]
             if unknown:
@@ -359,6 +412,7 @@ class ECOService:
             if eco["status"] not in ("DRAFT", "REBASE_REQUIRED"):
                 raise ECOError("NOT_FREEZABLE",
                                f"状态 {eco['status']} 不可冻结", 409)
+            self._assert_no_pending_quarantine(c)
             impact_svc = self._impact_svc()
             impact_snap = impact_svc.assert_snapshot_usable(c, eco["impact_snapshot_id"])
             impact_payload = {
@@ -394,22 +448,24 @@ class ECOService:
                 return self.eco_detail(eco_id, c)
 
             trunk = self._trunk(c)
+            self._assert_baseline_trusted(c, trunk["base_id"], "当前 trunk")
+            trust_gen = self._active_trust_generation(c)
             base_snap = self._base_snapshot(c)
             constraints = json.loads(trunk["working_constraints_json"])
             eff_mods = self._effective_modules(base_snap["modules"], modules, edits)
             snap = build_snapshot(eff_mods, constraints, modules,
                                  note=f"{eco_id} 冻结于 {trunk['base_id']}",
-                                 impact=impact_payload)
+                                 impact=impact_payload, trust_generation=trust_gen)
             fp = snapshot_fingerprint(snap)
             epoch = eco["freeze_epoch"] + 1
             c.execute(
                 "UPDATE eco SET status='FROZEN',submitted_at=COALESCE(submitted_at,?),"
                 "frozen_at=?,parent_baseline_id=?,base_revision_at_freeze=?,"
-                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?"
-                " WHERE id=?",
+                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?,"
+                "trust_generation=? WHERE id=?",
                 (utcnow(), utcnow(), trunk["base_id"], trunk["base_revision"],
                  trunk["constraints_version"], json.dumps(snap, ensure_ascii=False), fp,
-                 epoch, eco_id))
+                 epoch, trust_gen, eco_id))
             self._supersede_runs(c, eco_id, "refreeze")
             self._void_signoffs(c, eco_id, "ECO refrozen: epoch/fingerprint changed")
             for m in modules:
@@ -419,7 +475,8 @@ class ECOService:
             eco = self._get_eco(eco_id)
             self._dispatch(c, eco)
             self._audit(c, "eco.freeze", eco_id, by,
-                        {"fingerprint": fp, "epoch": epoch, "modules": modules})
+                        {"fingerprint": fp, "epoch": epoch, "modules": modules,
+                         "trust_generation": trust_gen})
             return self.eco_detail(eco_id, c)
 
     def abort_eco(self, eco_id, by):
@@ -466,7 +523,8 @@ class ECOService:
             eco = self._get_eco(eco_id)
             snap = json.loads(eco["snapshot_json"])
             spec = CHECKS[check_type]
-            inputs = {"verification_matrix": snap["verification_matrix"]}
+            inputs = {"verification_matrix": snap["verification_matrix"],
+                      "trust_generation": snap.get("trust_generation", 0)}
             if "netlist" in spec["scopes"]:
                 inputs["modules"] = snap["modules"]
             if "sdc" in spec["scopes"]:
@@ -898,6 +956,9 @@ class ECOService:
             if c.execute("SELECT 1 FROM eco WHERE status='RELEASING'").fetchone():
                 raise ECOError("RELEASE_IN_PROGRESS",
                                "存在发布中的 ECO，为保证原子性拒绝约束更新", 409)
+            if c.execute("SELECT 1 FROM quarantine_incident WHERE status='PENDING'").fetchone():
+                raise ECOError("QUARANTINE_PENDING",
+                               "事故隔离裁决未完成，禁止穿插基础约束更新", 409)
             trunk = self._trunk(c)
             cur = json.loads(trunk["working_constraints_json"])
             new = {**cur, **delta}
@@ -962,6 +1023,9 @@ class ECOService:
             if tgt["status"] != "FROZEN":
                 raise ECOError("TARGET_NOT_FROZEN",
                                f"并入方状态须为 FROZEN，实际 {tgt['status']}", 409)
+            self._assert_no_pending_quarantine(c)
+            self._assert_baseline_trusted(c, tgt["parent_baseline_id"], "目标 ECO 父")
+            trust_gen = self._active_trust_generation(c)
             blocked = c.execute(
                 "SELECT 1 FROM queue_entry WHERE eco_id=? AND blocker_eco_id=? "
                 "AND resolved_at IS NULL",
@@ -1029,18 +1093,18 @@ class ECOService:
             eff = self._effective_modules(base_snap["modules"], merged_modules, merged_edits)
             snap = build_snapshot(eff, constraints, merged_modules,
                                  note=f"{target_eco_id} 合并 {source_eco_id} 后重新冻结",
-                                 impact=impact_payload)
+                                 impact=impact_payload, trust_generation=trust_gen)
             fp = snapshot_fingerprint(snap)
             epoch = tgt["freeze_epoch"] + 1
             merged_input = {"scope": f"eco:{target_eco_id}", "roots": merged_roots,
                             "change_summary": merged_summary, "by": by}
             c.execute(
                 "UPDATE eco SET affected_modules_json=?,edits_json=?,snapshot_json=?,"
-                "fingerprint=?,freeze_epoch=?,impact_snapshot_id=?,impact_input_json=? "
-                "WHERE id=?",
+                "fingerprint=?,freeze_epoch=?,impact_snapshot_id=?,impact_input_json=?,"
+                "trust_generation=? WHERE id=?",
                 (json.dumps(merged_modules), json.dumps(merged_edits, ensure_ascii=False),
                  json.dumps(snap, ensure_ascii=False), fp, epoch, impact_snap["id"],
-                 json.dumps(merged_input, ensure_ascii=False), target_eco_id))
+                 json.dumps(merged_input, ensure_ascii=False), trust_gen, target_eco_id))
             self._supersede_runs(c, target_eco_id, "merge")
             self._void_signoffs(c, target_eco_id, "merge adjudication: scope expanded")
             for m in added:
@@ -1078,8 +1142,13 @@ class ECOService:
             if existing and existing["state"] == "RELEASING":
                 raise ECOError("RELEASE_PENDING",
                                "发布处于中断态，请调用 resume 完成或恢复", 409)
+            if existing and existing["state"] == "CANCELLED":
+                # 事故隔离可取消阶段1发布；保留 release_journal 审计后允许重新冻结再发布。
+                c.execute("DELETE FROM release WHERE eco_id=? AND state='CANCELLED'", (eco_id,))
             if eco["status"] != "FROZEN":
                 raise ECOError("NOT_FROZEN", f"状态 {eco['status']} 不可发布", 409)
+            self._assert_no_pending_quarantine(c)
+            self._assert_baseline_trusted(c, eco["parent_baseline_id"], "待发布 ECO 的父")
             self._impact_svc().assert_snapshot_usable(c, eco["impact_snapshot_id"])
             g = self.gate(eco, c)
             if not g["releasable"]:
@@ -1113,6 +1182,8 @@ class ECOService:
             eco = self._get_eco(eco_id)
             if eco["status"] != "RELEASING":
                 raise ECOError("BAD_STATE", f"ECO 状态 {eco['status']} 异常", 409)
+            self._assert_no_pending_quarantine(c)
+            self._assert_baseline_trusted(c, eco["parent_baseline_id"], "待发布 ECO 的父")
             # 恢复时重新验证：中断期间不允许任何变更（约束更新/中止均被拒绝），这里是纵深防御
             self._impact_svc().assert_snapshot_usable(c, eco["impact_snapshot_id"])
             g = self.gate(eco, c)
@@ -1124,9 +1195,10 @@ class ECOService:
             new_id = f"B-R{rev}"
             c.execute(
                 "INSERT INTO baseline(id,revision,parent_id,created_at,eco_id,snapshot_json,"
-                "fingerprint,published_by) VALUES(?,?,?,?,?,?,?,?)",
+                "fingerprint,published_by,trust_generation) VALUES(?,?,?,?,?,?,?,?,?)",
                 (new_id, rev, eco["parent_baseline_id"], utcnow(), eco_id,
-                 json.dumps(snap, ensure_ascii=False), eco["fingerprint"], by))
+                 json.dumps(snap, ensure_ascii=False), eco["fingerprint"], by,
+                 int(eco["trust_generation"] or 0)))
             c.execute("UPDATE trunk SET base_id=?, base_revision=? WHERE id=1",
                       (new_id, rev))
             c.execute("UPDATE eco SET status='RELEASED' WHERE id=?", (eco_id,))

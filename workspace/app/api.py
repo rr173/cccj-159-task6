@@ -16,6 +16,7 @@ from .service import ECOError, ECOService
 from .store import Store
 from .impact import ImpactService
 from .leases import LeaseError, LeaseService
+from .quarantine import QuarantineService
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -24,9 +25,11 @@ _MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; ch
 
 
 def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
-                  impact_svc: ImpactService | None = None):
+                  impact_svc: ImpactService | None = None,
+                  quarantine_svc: QuarantineService | None = None):
     lease_svc = lease_svc or LeaseService(svc.s, svc)
     impact_svc = impact_svc or ImpactService(svc.s)
+    quarantine_svc = quarantine_svc or QuarantineService(svc.s)
     class Handler(BaseHTTPRequestHandler):
         server_version = "ChipECO/1.0"
 
@@ -90,6 +93,8 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                     return self._static("ops.html")
                 if path == "/impact":
                     return self._static("impact.html")
+                if path == "/quarantine":
+                    return self._static("quarantine.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
                 # 更具体的字面路径先于参数化模式匹配
@@ -133,6 +138,17 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                     return self._send(200, {"events": impact_svc.list_audit(
                         scope=self._q("scope"), snapshot_id=self._q("snapshot_id"),
                         limit=self._q("limit", 100, int))})
+                if path == "/api/quarantine/board":
+                    return self._send(200, quarantine_svc.board())
+                if path == "/api/quarantine/incidents":
+                    return self._send(200, {"incidents": quarantine_svc.list_incidents()})
+                if path == "/api/quarantine/audit":
+                    return self._send(200, {"events": quarantine_svc.audit(
+                        incident_id=self._q("incident_id"), event=self._q("event"),
+                        limit=self._q("limit", 200, int))})
+                qm = re.fullmatch(r"/api/quarantine/incidents/([^/]+)", path)
+                if qm:
+                    return self._send(200, quarantine_svc.incident(qm.group(1)))
                 m = re.fullmatch(r"/api/impact/snapshots/([^/]+)", path)
                 if m:
                     return self._send(200, impact_svc.get_snapshot(m.group(1)))
@@ -244,6 +260,29 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
                 if m:
                     return self._send(201, impact_svc.exclude(
                         m.group(1), b.get("exclusions", []), b.get("by", "?")))
+                # ---- 已发行版本事故隔离 ----
+                if path == "/api/quarantine/incidents":
+                    d = quarantine_svc.register(
+                        b.get("by", b.get("registered_by", "?")),
+                        b.get("baseline_id", b.get("released_baseline_id")),
+                        b.get("batch_no", b.get("batch")), b.get("reason"),
+                        b.get("evidence"), incident_id=b.get("incident_id"),
+                        idempotency_key=b.get("idempotency_key"),
+                        failpoint=b.get("failpoint"),
+                        role=b.get("role", "QUALITY_LEAD"))
+                    return self._send(201 if d.get("state_changed") else 200, d)
+                if path == "/api/quarantine/recover-all":
+                    d = quarantine_svc.recover()
+                    return self._send(200, d)
+                qm = re.fullmatch(r"/api/quarantine/incidents/([^/]+)/recover", path)
+                if qm:
+                    return self._send(200, quarantine_svc.finish_isolation(
+                        qm.group(1), b.get("by", "?")))
+                qm = re.fullmatch(r"/api/quarantine/incidents/([^/]+)/restore-confirm", path)
+                if qm:
+                    return self._send(200, quarantine_svc.confirm_restore(
+                        qm.group(1), b.get("role"), b.get("user", b.get("by", "?")),
+                        b.get("note", "")))
                 # ---- 验证执行租约协调（独立 API）----
                 if path == "/api/leases/claims":
                     d = lease_svc.claim(
@@ -285,16 +324,21 @@ def serve(db_path=":memory:", port=8080, lease_ttl_seconds=600):
     store = Store(db_path)
     svc = ECOService(store)
     lease_svc = LeaseService(store, svc, ttl_seconds=lease_ttl_seconds)
+    quarantine_svc = QuarantineService(store)
+    # 进程启动：先完成事故隔离裁决，再恢复租约（隔离会使旧租约失效）
+    qrec = quarantine_svc.recover()
     # 进程启动：恢复未过期租约，回收已过期租约（落盘租约跨重启存活）
     rec = lease_svc.recover()
     impact_svc = ImpactService(store)
     httpd = ThreadingHTTPServer(
-        ("0.0.0.0", port), _make_handler(svc, lease_svc, impact_svc))
+        ("0.0.0.0", port), _make_handler(svc, lease_svc, impact_svc, quarantine_svc))
     print(f"ECO 基线服务已启动: http://localhost:{port}  (db={db_path})")
+    print(f"事故隔离: 恢复未完成裁决 {qrec['count']} 起")
     print(f"租约协调: 恢复未过期 {rec['restored_held']} 条，回收过期 {len(rec['recovered_expired'])} 条，"
           f"对账 {rec['reconciled']} 条")
     print(f"Runner 操作页: http://localhost:{port}/ops")
     print(f"电路影响闭包操作页: http://localhost:{port}/impact")
+    print(f"事故隔离操作页: http://localhost:{port}/quarantine")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

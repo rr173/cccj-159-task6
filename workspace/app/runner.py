@@ -13,7 +13,8 @@ from .store import CHECKS
 
 def compute_input_fingerprint(check_type: str, inputs: dict) -> str:
     spec = CHECKS[check_type]
-    obj = {"verification_matrix": inputs["verification_matrix"]}
+    obj = {"verification_matrix": inputs["verification_matrix"],
+           "trust_generation": inputs.get("trust_generation", 0)}
     if "netlist" in spec["scopes"]:
         obj["modules"] = {
             m: {"netlist": d["netlist"], "version": d["version"]}

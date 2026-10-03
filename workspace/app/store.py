@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS baseline (
     eco_id          TEXT,
     snapshot_json   TEXT NOT NULL,
     fingerprint     TEXT NOT NULL,
-    published_by    TEXT NOT NULL
+    published_by    TEXT NOT NULL,
+    trust_generation INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS trunk (
@@ -37,6 +38,77 @@ CREATE TABLE IF NOT EXISTS trunk (
     working_constraints_json TEXT NOT NULL,
     constraints_version    INTEGER NOT NULL DEFAULT 1
 );
+
+-- 事故隔离裁决（两阶段：REGISTERED/PENDING 落盘后，可在重启时恢复 ISOLATED）
+CREATE TABLE IF NOT EXISTS quarantine_incident (
+    id                  TEXT PRIMARY KEY,
+    baseline_id         TEXT NOT NULL,
+    batch_no            TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    evidence_json       TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    registered_by       TEXT NOT NULL,
+    status              TEXT NOT NULL,          -- PENDING / ISOLATED / RESTORED
+    generation          INTEGER,
+    trusted_ancestor_id TEXT,
+    guard_revision      INTEGER,
+    failpoint           TEXT,
+    created_at          TEXT NOT NULL,
+    isolated_at         TEXT,
+    restored_at         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_quarantine_request
+ON quarantine_incident(request_fingerprint)
+WHERE status IN ('PENDING','ISOLATED','RESTORED');
+
+CREATE TABLE IF NOT EXISTS quarantine_request (
+    request_key     TEXT PRIMARY KEY,
+    incident_id     TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_baseline (
+    incident_id     TEXT NOT NULL,
+    baseline_id     TEXT NOT NULL,
+    generation      INTEGER NOT NULL,
+    relation        TEXT NOT NULL,              -- HIT / DESCENDANT
+    trust_status    TEXT NOT NULL,              -- UNTRUSTED / RESTORED
+    marked_at       TEXT NOT NULL,
+    restored_at     TEXT,
+    PRIMARY KEY(incident_id, baseline_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qb_baseline ON quarantine_baseline(baseline_id, trust_status);
+
+CREATE TABLE IF NOT EXISTS quarantine_eco (
+    incident_id     TEXT NOT NULL,
+    eco_id          TEXT NOT NULL,
+    generation      INTEGER NOT NULL,
+    previous_status TEXT NOT NULL,
+    action          TEXT NOT NULL,              -- REBASE_REQUIRED / RELEASE_CANCELLED
+    marked_at       TEXT NOT NULL,
+    restored_at     TEXT,
+    PRIMARY KEY(incident_id, eco_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qe_eco ON quarantine_eco(eco_id);
+
+CREATE TABLE IF NOT EXISTS quarantine_confirmation (
+    incident_id     TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    user            TEXT NOT NULL,
+    note            TEXT,
+    at              TEXT NOT NULL,
+    PRIMARY KEY(incident_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_journal (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id     TEXT NOT NULL,
+    event           TEXT NOT NULL,
+    actor           TEXT,
+    at              TEXT NOT NULL,
+    detail_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_qj_incident ON quarantine_journal(incident_id, seq);
 
 CREATE TABLE IF NOT EXISTS eco (
     id              TEXT PRIMARY KEY,
@@ -56,7 +128,8 @@ CREATE TABLE IF NOT EXISTS eco (
     freeze_epoch    INTEGER NOT NULL DEFAULT 0,
     merge_of_json   TEXT,
     impact_snapshot_id TEXT,
-    impact_input_json  TEXT
+    impact_input_json  TEXT,
+    trust_generation INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS check_run (
@@ -141,7 +214,7 @@ CREATE TABLE IF NOT EXISTS adjudication (
 
 CREATE TABLE IF NOT EXISTS release (
     eco_id          TEXT PRIMARY KEY,
-    state           TEXT NOT NULL,            -- RELEASING / PUBLISHED
+    state           TEXT NOT NULL,            -- RELEASING / PUBLISHED / CANCELLED
     new_baseline_id TEXT,
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
@@ -390,7 +463,10 @@ class Store:
     def _migrate(self):
         """对既有落盘库补齐代理签核新增列（CREATE TABLE IF NOT EXISTS 不会改老表）。"""
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(signoff)")}
+        baseline_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(baseline)")}
         with self.tx() as c:
+            if "trust_generation" not in baseline_cols:
+                c.execute("ALTER TABLE baseline ADD COLUMN trust_generation INTEGER NOT NULL DEFAULT 0")
             if "signoff_kind" not in cols:
                 c.execute("ALTER TABLE signoff ADD COLUMN signoff_kind TEXT NOT NULL DEFAULT 'DIRECT'")
             if "delegation_id" not in cols:
@@ -406,6 +482,8 @@ class Store:
                 c.execute("ALTER TABLE eco ADD COLUMN impact_snapshot_id TEXT")
             if "impact_input_json" not in eco_cols:
                 c.execute("ALTER TABLE eco ADD COLUMN impact_input_json TEXT")
+            if "trust_generation" not in eco_cols:
+                c.execute("ALTER TABLE eco ADD COLUMN trust_generation INTEGER NOT NULL DEFAULT 0")
 
     # ---- 事务辅助 ----
     class _Tx:
@@ -470,7 +548,10 @@ class Store:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff_delegation",
                       "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
-                      "lease_event", "lease_claim", "check_lease", "impact_override",
+                      "lease_event", "lease_claim", "check_lease",
+                      "quarantine_journal", "quarantine_confirmation", "quarantine_eco",
+                      "quarantine_baseline", "quarantine_request", "quarantine_incident",
+                      "impact_override",
                       "impact_latest", "impact_snapshot", "impact_request",
                       "impact_current", "impact_topology"]:
                 c.execute(f"DELETE FROM {t}")

@@ -23,6 +23,7 @@
 | 基础约束更新途中到来 | 在验 ECO → `REBASE_REQUIRED`，全部旧检查与签核作废；约束更新期间若有发布中 ECO 则直接拒绝，冻结世界 |
 | 两个 ECO 修改重叠模块 | 模块锁互斥，后来单 `QUEUED` 明确排队；可由 CCB 裁决 `MERGE` 合并（逐模块 TARGET/SOURCE 赢家），合并使冻结纪元 +1 并整轮重跑 |
 | 发布中断 | 两阶段发布：阶段1提交 `RELEASING`（可在其后崩溃），阶段2原子写入新基线；中断期间禁止中止 ECO / 更新约束，`resume` 幂等恢复 |
+| 已发行版本事故 | 质量负责人登记批次/原因/证据后，命中版本及全部后代原子标为不可信；trunk 回退到最近可信祖先，未发行 ECO 转回待重新对齐，隔离/恢复推进信任代次，旧检查和旧签核一律重跑重签 |
 
 ## 防串用的核心机制：冻结指纹 + 纪元
 
@@ -84,6 +85,31 @@
   （`STALE_SUPERSEDED`）、依赖门禁（`DEPENDENCY_BLOCKED`），FAIL 仍只能走既有
   `rerun`，双签与两阶段发布约束完全不变；ECO 侧 `rejected_result` 与租约侧审计双侧留痕。
 
+## 已发行版本事故隔离
+
+质量负责人可对已发行基线登记故障批次、根因和证据，操作页为 `/quarantine`，
+API 前缀 `/api/quarantine`。系统在同一 SQLite `BEGIN IMMEDIATE` 事务中裁决整条谱系：
+
+- **受影响谱系**：以命中基线为根，沿 `parent_id` 标记全部后代；基线和后代均写入
+  `UNTRUSTED`，trunk 原子回退到最近可信祖先。未发行 ECO（FROZEN / QUEUED /
+  REBASE_REQUIRED）转回 `REBASE_REQUIRED`，发布中的 ECO 取消并同样重新对齐；
+  旧 check_run 全部 `SUPERSEDED`、旧签核 `voided`、HELD 租约 `INVALIDATED`。
+- **两阶段可恢复**：登记请求先落 `quarantine_incident(status=PENDING)` 与
+  `REGISTERED` 日志，再执行隔离；`AFTER_REGISTER` 崩溃后，相同请求或启动
+  `recover()` 只恢复首次裁决。待恢复期间，同谱系新发行/冻结/约束更新均以
+  `QUARANTINE_PENDING` 拒绝，保证隔离与新发行按同一谱系原子串行裁决。
+- **请求幂等**：相同 `{命中版本,批次,原因,证据}` 或显式 `idempotency_key` 重放
+  返回首次事故（`replayed:true`），不会第二次迁移状态。
+- **信任代次 trust_generation**：隔离代次写入基线、ECO、冻结快照、检查作用域指纹和
+  发布基线；恢复可信再推进一代。因此恢复后仍处于流程中的 ECO 必须重新冻结、整轮
+  重跑、重新双签，任何旧检查结果和旧签核都不能跨隔离代次复用。
+- **双角色恢复**：恢复需质量负责人和发布负责人两个不同自然人确认；隔离期间若出现
+  新发行基线（`revision > guard_revision`），返回 `RESTORE_FORK_DETECTED`，
+  双角色确认也不能恢复。恢复后 trunk 指回原谱系末端，并以新信任代次重新开线。
+- **操作页/审计**：`/quarantine` 展示受影响谱系、当前可信祖先、待处理变更、
+  事故确认状态和 `quarantine_journal` 落盘日志；所有 REGISTER/ISOLATE/RESTORE
+  事件同步写 `audit_log`。
+
 ## 快速开始
 
 ```bash
@@ -96,6 +122,8 @@ open http://localhost:8080
 open http://localhost:8080/ops
 # 电路影响闭包操作页（拓扑版本、传播解释、人工排除、审计）
 open http://localhost:8080/impact
+# 已发行版本事故隔离操作页（谱系、可信祖先、待处理变更、双角色恢复、审计）
+open http://localhost:8080/quarantine
 
 # 启动独立的设计签名封装服务（默认 8090，SQLite + 内容寻址 blob 落盘）
 python3 -m app.envelope_api --db data/envelope.db --port 8090
@@ -107,7 +135,7 @@ python3 -m app.envelope_cli --db data/envelope.db demo
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（98 个：原 ECO/租约/API 73 个 + 签名封装 11 个 + 影响闭包 14 个）
+# 全部测试（109 个：原 ECO/租约/API/影响闭包 98 个 + 事故隔离 11 个，含 HTTP 端到端）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -118,6 +146,7 @@ app/
   store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约与租约审计表
   service.py  领域核心：冻结指纹、影响闭包绑定、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
   impact.py   版本化电路拓扑、影响闭包传播、跨时钟/接口/约束/策略强制节点、人工排除与审计
+  quarantine.py 已发行版本事故隔离：两阶段落盘恢复、谱系后代裁决、信任代次、双角色恢复防新分叉
   leases.py   验证执行租约协调：幂等领取(原子单赢家)、续租、代次+HMAC凭据完成、超时接管、重启恢复
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
   envelope_store.py 签名封装 SQLite schema、内容寻址 blob 与崩溃恢复元数据
@@ -134,6 +163,8 @@ web/
   ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
   impact.html 电路影响闭包操作页（拓扑版本、闭包候选、传播边解释、人工排除、审计）
   impact.js   零依赖 JS；发布拓扑、计算闭包、提交带理由排除并展示可操作错误
+  quarantine.html 已发行版本事故隔离操作页（受影响谱系、可信祖先、待处理变更、双角色恢复、审计）
+  quarantine.js   零依赖 JS；登记事故、恢复中断裁决、提交双角色恢复确认
   envelopes.html 设计签名发布信封页面（谱系、签名状态、校验结果、审计）
   envelopes.js   零依赖 JS；支持浏览器 Ed25519 签名与信封/发布查询
 tests/
@@ -141,7 +172,8 @@ tests/
   test_delegation.py  18 个临时代理签核测试
   test_leases.py      22 个租约协调不变量测试（并发单赢家/幂等/代次凭据/接管/重跑迟到/重启恢复）
   test_impact.py      14 个影响闭包测试（传播/强制节点/排除冲突/环/缺节点/超大闭包/动态门禁/并发单当前版本）
-  test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
+  test_quarantine.py  10 个事故隔离测试（后代隔离/幂等/发布并发/落盘恢复/双角色恢复/防新分叉/信任代次作废）
+  test_api.py         10 个真实 socket HTTP 测试（含租约领取-接管-完成、事故隔离/恢复端到端）
   test_envelope.py       9 个发布信封领域不变量（并发同内容、续传、撤权、签名者/根密钥轮换、篡改、恢复/同名冲突）
   test_envelope_api.py   2 个真实 HTTP 端到端测试（双签发布离线验真、分块续传页面）
 ```
@@ -173,6 +205,10 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`
 - 电路影响闭包：`GET/POST /api/impact/topology` · `POST /api/impact/compute` ·
   `POST /api/impact/snapshots/{id}/exclusions` · `GET /api/impact/audit`（操作页 `/impact`）
+- 已发行版本事故隔离：`POST /api/quarantine/incidents` ·
+  `POST /api/quarantine/incidents/{id}/recover` ·
+  `POST /api/quarantine/incidents/{id}/restore-confirm` ·
+  `GET /api/quarantine/board|incidents|audit`（操作页 `/quarantine`）
 - 临时代理签核（管理员）：`POST /api/admin/delegations` ·
   `POST /api/admin/delegations/{id}/revoke` · `GET /api/current-signers`
 - `GET  /api/workbench` · `GET /api/baselines/diff?from=&to=` · `.../diff.zip`

@@ -8,7 +8,7 @@
 
 ## 状态与原因码
 
-- **ECO 状态**：`DRAFT / FROZEN / QUEUED / REBASE_REQUIRED / RELEASING / RELEASED / MERGED / ABORTED`
+- **ECO 状态**：`DRAFT / FROZEN / QUEUED / REBASE_REQUIRED / RELEASING / RELEASED / MERGED / ABORTED`（事故隔离可把阶段1发布取消为内部 `CANCELLED` 发布记录，ECO 回到 `REBASE_REQUIRED`）
 - **检查状态**：`PENDING / BLOCKED / PASS / FAIL / SUPERSEDED`（门洁面可能显示 `MISSING`）
 - **拒收原因 reason**：
   - `FINGERPRINT_MISMATCH` 结果指纹与冻结输入不符（拿错基线/输入被改）
@@ -17,6 +17,26 @@
   - `DEPENDENCY_BLOCKED` 依赖前置尚未全部 PASS
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
+  - `PARENT_BASELINE_QUARANTINED` 父版本已被事故隔离，禁止作为新冻结/新发行父版本
+  - `QUARANTINE_PENDING` 同一谱系有事故隔离裁决待完成，禁止穿插新发行
+  - `LINEAGE_ALREADY_QUARANTINED` 命中版本或后代已有活动隔离，禁止重复迁移
+  - `RESTORE_FORK_DETECTED` 隔离期间发生新发行/新分叉，双角色恢复被拒绝
+
+### 已发行版本事故隔离
+
+质量负责人登记故障批次、原因和证据后，服务沿基线 `parent_id` 原子标记命中版本及全部后代。
+
+- 事故状态：`PENDING`（登记/阶段1已落盘，待阶段2）、`ISOLATED`、`RESTORED`。
+- 基线标记：`HIT/DESCENDANT` + `trust_status=UNTRUSTED/RESTORED`；trunk 在隔离时回退到
+  最近可信祖先，恢复时指回原谱系末端。
+- 隔离代次 `trust_generation` 写入基线、ECO、冻结快照和检查作用域指纹；恢复再推进一代，
+  旧检查结果、旧签核、HELD 租约全部作废，不能跨代次复用。
+- 相同 `{baseline_id,batch_no,reason,evidence}` 或 `idempotency_key` 重放返回首次事故
+  （`replayed:true`），不产生第二次状态迁移；显式相同 `incident_id` 冲突返回 409。
+- 服务中断后以 `PENDING + quarantine_journal(REGISTERED)` 恢复；待恢复期间冻结、发布、
+  恢复发布和约束更新均返回 `QUARANTINE_PENDING`，保证同一谱系原子串行裁决。
+- 恢复必须由 `QUALITY_LEAD` 与 `RELEASE_MANAGER` 两个不同自然人分别确认；同角色同人
+  重放幂等。`guard_revision` 后若出现任何新 baseline，返回 `RESTORE_FORK_DETECTED`。
 
 ### 电路影响闭包（审核前自动复验分析）
 
@@ -128,6 +148,18 @@
 | POST | `/api/impact/snapshots/{id}/exclusions` | `{by, exclusions:[{node, reason}]}`；追加人工覆盖版本 |
 | GET | `/api/impact/audit?scope=&snapshot_id=&limit=` | `impact.auto/impact.override/topology.publish` 审计 |
 | 页面 | `/impact` | 拓扑发布、闭包计算、边解释、人工排除和审计操作页 |
+
+### 已发行版本事故隔离
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/quarantine/incidents` | `{baseline_id,batch_no,reason,evidence,by,role?:QUALITY_LEAD,incident_id?,idempotency_key?,failpoint?}`；阶段1落盘后阶段2原子隔离。`evidence` 为非空字符串数组或对象数组 |
+| POST | `/api/quarantine/incidents/{id}/recover` | 显式恢复该事故未完成的阶段2；已隔离则幂等返回首次结果 |
+| POST | `/api/quarantine/recover-all` | 启动恢复全部 `PENDING` 事故裁决，返回 `{count,recovered}` |
+| POST | `/api/quarantine/incidents/{id}/restore-confirm` | `{role:QUALITY_LEAD|RELEASE_MANAGER,user,note?}`；两个不同自然人齐备后恢复可信并推进信任代次 |
+| GET | `/api/quarantine/incidents` / `.../{id}` | 事故列表/详情（命中基线、确认、等待角色）|
+| GET | `/api/quarantine/board` | 操作页聚合：受影响谱系、当前可信祖先、待处理变更、事故和最近审计 |
+| GET | `/api/quarantine/audit?incident_id=&event=&limit=` | `REGISTERED/ISOLATED/RESTORE_CONFIRMED/RESTORE_REJECTED/RESTORED` 落盘日志 |
+| 页面 | `/quarantine` | 事故登记、受影响谱系、可信祖先、待处理变更和双角色恢复操作页 |
 
 ### 验证（Runner 协议）
 | 方法 | 路径 | 说明 |

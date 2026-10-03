@@ -139,6 +139,48 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(m["freeze_epoch"], 2)
         self.assertIn("B_FIX", m["edits"]["noc"]["netlist"])
 
+    def test_quarantine_page_and_api(self):
+        s, data, _ = self.call("/quarantine", raw=True)
+        self.assertEqual(s, 200)
+        self.assertIn("事故隔离".encode(), data)
+        s, d = self.call("/api/ecos", "POST", {
+            "title": "隔离 HTTP 流", "owner": "net.eng", "affected_modules": ["dbg"],
+            "edits": {"dbg": {"netlist": "MODULE dbg; CELL Q_HTTP; ENDMODULE"}}})
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "net.eng"})
+        for _ in range(20):
+            s, d = self.call(f"/api/ecos/{eid}")
+            pending = [c["type"] for c in d["gate"]["checks"] if c["status"] == "PENDING"]
+            if not pending:
+                break
+            for t in pending:
+                s, pkt = self.call(f"/api/ecos/{eid}/checks/{t}/inputs")
+                fp = compute_input_fingerprint(t, pkt["inputs"])
+                s, _ = self.call(f"/api/ecos/{eid}/checks/{t}/results", "POST",
+                                 {"run_id": pkt["run_id"], "fingerprint": fp, "verdict": "PASS"})
+        self.call(f"/api/ecos/{eid}/signoff", "POST", {"role": "TIMING_LEAD", "user": "q.t"})
+        self.call(f"/api/ecos/{eid}/signoff", "POST", {"role": "METHODOLOGY_LEAD", "user": "q.m"})
+        s, rel = self.call(f"/api/ecos/{eid}/release", "POST", {"by": "net.eng"})
+        self.assertEqual(s, 200)
+        body = {"baseline_id": rel["new_baseline_id"], "batch_no": "HTTP-LOT",
+                "reason": "HTTP root cause", "evidence": ["FA-HTTP"], "by": "quality.http"}
+        s, q1 = self.call("/api/quarantine/incidents", "POST", body)
+        self.assertEqual(s, 201, q1)
+        self.assertEqual(q1["status"], "ISOLATED")
+        s, q2 = self.call("/api/quarantine/incidents", "POST", body)
+        self.assertEqual(s, 200)
+        self.assertTrue(q2["replayed"])
+        s, board = self.call("/api/quarantine/board")
+        self.assertTrue(any(b["id"] == rel["new_baseline_id"] and not b["trusted"]
+                            for b in board["affected_lineage"]))
+        s, _ = self.call(f"/api/quarantine/incidents/{q1['id']}/restore-confirm", "POST",
+                         {"role": "QUALITY_LEAD", "user": "quality.http"})
+        self.assertEqual(s, 200)
+        s, restored = self.call(f"/api/quarantine/incidents/{q1['id']}/restore-confirm", "POST",
+                                {"role": "RELEASE_MANAGER", "user": "release.http"})
+        self.assertEqual(s, 200, restored)
+        self.assertEqual(restored["status"], "RESTORED")
+
     def test_static_index(self):
         s, data, _ = self.call("/", raw=True)
         self.assertEqual(s, 200)
